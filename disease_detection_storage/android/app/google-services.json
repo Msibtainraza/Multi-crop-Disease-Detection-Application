@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "441806356201",
+    "project_id": "fivecropsystem",
+    "storage_bucket": "fivecropsystem.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:441806356201:android:91ebfa1fb10c4bcb5b3a78",
+        "android_client_info": {
+          "package_name": "com.example.disease_detection_storage"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB8pZB2w6YiXkKJA9KzG59-Zw22Unp8C-0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

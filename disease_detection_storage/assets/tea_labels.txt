@@ -1,0 +1,6 @@
+Blister Blight
+Brown Blight
+Gray Blight
+Healthy
+Invalid
+Red Rust

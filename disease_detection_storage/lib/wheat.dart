@@ -1,0 +1,467 @@
+
+import 'dart:io';
+import 'dart:typed_data';
+import 'dart:convert';
+
+import 'package:disease_detection_storage/reg_screen.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:tflite_flutter/tflite_flutter.dart';
+import 'package:flutter/services.dart';
+import 'package:image/image.dart' as img;
+
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:geocoding/geocoding.dart';
+
+import 'manual_report.dart';
+
+class Wheat extends StatefulWidget {
+  const Wheat({super.key});
+
+  @override
+  State<Wheat> createState() => _WheatState();
+}
+
+class _WheatState extends State<Wheat> {
+
+  Interpreter? _interpreter;
+  List<String> _labels = [];
+
+  Uint8List? _selectedImage;
+
+  String _prediction = "";
+  double _confidence = 0;
+
+  String locationText = "Location not fetched";
+
+  double? latitude;
+  double? longitude;
+
+  bool _isPredicting = false;
+  bool _isUploading = false;
+
+  final commentController = TextEditingController();
+
+  static const int imageSize = 224;   // Wheat model was trained on 224x224
+
+  @override
+  void initState() {
+    super.initState();
+    loadModel();
+  }
+
+  @override
+  void dispose() {
+    _interpreter?.close();
+    super.dispose();
+  }
+
+  Future<void> loadModel() async {
+    try {
+      _interpreter = await Interpreter.fromAsset('assets/wheat_model.tflite');
+
+      final labelsData = await rootBundle.loadString('assets/wheat.txt');
+      _labels = LineSplitter.split(labelsData).toList();
+
+      print("Wheat model loaded successfully. Labels: ${_labels.length}");
+    } catch (e) {
+      print("Error loading wheat model: $e");
+      showMessage("Failed to load Wheat model");
+    }
+  }
+
+  Future<void> pickImage(ImageSource source) async {
+    final picker = ImagePicker();
+    final XFile? picked = await picker.pickImage(source: source);
+
+    if (picked == null) return;
+
+    final bytes = await File(picked.path).readAsBytes();
+
+    setState(() {
+      _selectedImage = bytes;
+      _prediction = "";
+      _confidence = 0;
+    });
+
+    await predict(bytes);
+  }
+
+  Float32List imageToTensor(img.Image image) {
+    final Float32List buffer = Float32List(imageSize * imageSize * 3);
+    int index = 0;
+
+    for (int y = 0; y < imageSize; y++) {
+      for (int x = 0; x < imageSize; x++) {
+        final pixel = image.getPixel(x, y);
+        buffer[index++] = pixel.r.toDouble();
+        buffer[index++] = pixel.g.toDouble();
+        buffer[index++] = pixel.b.toDouble();
+      }
+    }
+    return buffer;
+  }
+
+  Future<void> predict(Uint8List imageBytes) async {
+    if (_interpreter == null) {
+      showMessage("Model not loaded yet");
+      return;
+    }
+
+    setState(() {
+      _isPredicting = true;
+    });
+
+    try {
+      final decoded = img.decodeImage(imageBytes);
+      if (decoded == null) {
+        setState(() {
+          _isPredicting = false;
+        });
+        return;
+      }
+
+      final resized = img.copyResize(decoded, width: imageSize, height: imageSize);
+      final input = imageToTensor(resized);
+      final inputTensor = input.reshape([1, imageSize, imageSize, 3]);
+
+      final output = List.generate(1, (_) => List.filled(_labels.length, 0.0));
+
+      // ====================== INFERENCE TIME MEASUREMENT ======================
+      final stopwatch = Stopwatch()..start();
+
+      _interpreter!.run(inputTensor, output);
+
+      stopwatch.stop();
+      final inferenceTimeMs = stopwatch.elapsedMilliseconds;
+      // ========================================================================
+
+      print("Inference Time: $inferenceTimeMs ms");
+
+      double bestScore = output[0][0];
+      int bestIndex = 0;
+
+      for (int i = 1; i < output[0].length; i++) {
+        if (output[0][i] > bestScore) {
+          bestScore = output[0][i];
+          bestIndex = i;
+        }
+      }
+
+      setState(() {
+        _confidence = bestScore * 100;
+
+        if (_confidence < 80) {
+          _prediction = "Invalid Image";
+        } else {
+          _prediction = "${_labels[bestIndex]}  ($inferenceTimeMs ms)";
+        }
+
+        _isPredicting = false;
+      });
+    } catch (e) {
+      print("Prediction error: $e");
+      setState(() {
+        _isPredicting = false;
+        _prediction = "Error during prediction";
+      });
+      showMessage("Prediction failed: $e");
+    }
+  }
+
+  Future<void> getLocation() async {
+    try {
+      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        showMessage("Please enable Location / GPS");
+        return;
+      }
+
+      LocationPermission permission = await Geolocator.checkPermission();
+
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+        if (permission == LocationPermission.denied) {
+          showMessage("Location permission denied");
+          return;
+        }
+      }
+
+      if (permission == LocationPermission.deniedForever) {
+        showMessage("Location permission permanently denied. Please enable it from Settings.");
+        return;
+      }
+
+      Position position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      );
+
+      latitude = position.latitude;
+      longitude = position.longitude;
+
+      List<Placemark> placemarks = await placemarkFromCoordinates(latitude!, longitude!);
+      Placemark place = placemarks.first;
+
+      setState(() {
+        locationText = "${place.locality ?? ''}, ${place.administrativeArea ?? ''}, ${place.country ?? ''}";
+      });
+    } catch (e) {
+      showMessage("Location error: $e");
+    }
+  }
+
+  Future<void> sendReport() async {
+    if (_selectedImage == null) {
+      showMessage("Please capture image first");
+      return;
+    }
+
+    setState(() {
+      _isUploading = true;
+    });
+
+    try {
+      final String base64Image = base64Encode(_selectedImage!);
+
+      await FirebaseFirestore.instance.collection("detections").add({
+        "crop": "Wheat",
+        "disease": _prediction,
+        "confidence": _confidence,
+        "location": locationText,
+        "latitude": latitude,
+        "longitude": longitude,
+        "comment": commentController.text.isEmpty ? null : commentController.text,
+        "image_base64": base64Image,
+        "timestamp": FieldValue.serverTimestamp(),
+      });
+
+      showMessage("Report sent successfully");
+      commentController.clear();
+    } catch (e) {
+      showMessage("Upload failed: $e");
+    }
+
+    setState(() {
+      _isUploading = false;
+    });
+  }
+
+  void showMessage(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  Widget cardTitle(String text) {
+    return Text(
+      text,
+      style: const TextStyle(
+        fontSize: 18,
+        fontWeight: FontWeight.bold,
+        color: Colors.green,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("Wheat Disease Detection"),
+        backgroundColor: const Color.fromARGB(255, 5, 100, 8),
+      ),
+      body: Stack(
+        children: [
+          Positioned.fill(
+            child: Image.asset(
+              "images/background.jpg",
+              fit: BoxFit.cover,
+            ),
+          ),
+          Positioned.fill(
+            child: Container(
+              color: Colors.black.withOpacity(0.25),
+            ),
+          ),
+          SingleChildScrollView(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              children: [
+                Card(
+                  elevation: 8,
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      children: [
+                        cardTitle("Leaf Image Capture"),
+                        const SizedBox(height: 10),
+                        Container(
+                          height: 260,
+                          width: double.infinity,
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: Colors.green, width: 2),
+                            color: Colors.grey[200],
+                          ),
+                          child: _selectedImage == null
+                              ? const Center(child: Text("Capture Wheat Leaf Image"))
+                              : ClipRRect(
+                                  borderRadius: BorderRadius.circular(12),
+                                  child: Image.memory(
+                                    _selectedImage!,
+                                    fit: BoxFit.cover,
+                                  ),
+                                ),
+                        ),
+                        const SizedBox(height: 10),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                          children: [
+                            ElevatedButton.icon(
+                              onPressed: () => pickImage(ImageSource.camera),
+                              icon: const Icon(Icons.camera),
+                              label: const Text("Camera"),
+                            ),
+                            ElevatedButton.icon(
+                              onPressed: () => pickImage(ImageSource.gallery),
+                              icon: const Icon(Icons.photo),
+                              label: const Text("Gallery"),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+                Card(
+                  elevation: 8,
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      children: [
+                        cardTitle("AI Diagnosis"),
+                        const SizedBox(height: 10),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text("Disease"),
+                            Text(
+                              _prediction,
+                              style: const TextStyle(
+                                color: Colors.green,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const Divider(),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text("Confidence"),
+                            Text("${_confidence.toStringAsFixed(2)} %"),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+                Card(
+                  elevation: 8,
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      children: [
+                        cardTitle("Location"),
+                        ElevatedButton.icon(
+                          onPressed: getLocation,
+                          icon: const Icon(Icons.location_on),
+                          label: const Text("Detect Location"),
+                        ),
+                        const SizedBox(height: 10),
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.all(10),
+                          decoration: BoxDecoration(
+                            color: Colors.grey[200],
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Text(locationText),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+                Card(
+                  elevation: 8,
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        cardTitle("User Feedback (Optional)"),
+                        const SizedBox(height: 10),
+                        TextField(
+                          controller: commentController,
+                          maxLines: 4,
+                          decoration: const InputDecoration(
+                            hintText: "Describe symptoms...",
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.green,
+                    padding: const EdgeInsets.symmetric(horizontal: 30, vertical: 14),
+                  ),
+                  onPressed: sendReport,
+                  icon: const Icon(Icons.send),
+                  label: const Text("Send Result to Research Server"),
+                ),
+                const SizedBox(height: 10),
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.orange,
+                  ),
+                  onPressed: () {
+                    final user = FirebaseAuth.instance.currentUser;
+                    if (user != null) {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => const ManualReportScreen(),
+                        ),
+                      );
+                    } else {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => const RegisterScreen(),
+                        ),
+                      );
+                    }
+                  },
+                  icon: const Icon(Icons.chat),
+                  label: const Text("Send us a Report"),
+                ),
+              ],
+            ),
+          ),
+          if (_isPredicting) const Center(child: CircularProgressIndicator()),
+          if (_isUploading) const Center(child: CircularProgressIndicator()),
+        ],
+      ),
+    );
+  }
+}
